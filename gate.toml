@@ -1,0 +1,22 @@
+# What the gate runs on each platform (luce-base tools/gate.py, docs/CI.md): bash commands
+# in this checkout, in order, beside its dependencies at main, with LUCE_BASE and LUCE
+# naming the toolchain the gate built.
+tools = ["luce"]
+
+[macos]
+steps = [
+    # module tests, fixtures and the Luce crossing
+    "./test.sh --base ../luce-base/build/luce-base --luce ../luce/build/luce",
+]
+
+[linux]
+steps = [
+    # module tests, fixtures and the Luce crossing
+    "./test.sh --base ../luce-base/build/luce-base --luce ../luce/build/luce",
+]
+
+[windows]
+steps = [
+    # module tests, fixtures and the Luce crossing
+    "./test.sh --base ../luce-base/build/luce-base --luce ../luce/build/luce",
+]
