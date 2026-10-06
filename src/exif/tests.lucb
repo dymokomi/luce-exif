@@ -1,0 +1,202 @@
+#==============================================================================================
+#
+#   exif/tests - Tests on hand-built files
+#
+#   DESCRIPTION:
+#       Small TIFF, JPEG and PNG files built byte by byte: the tags this package reads, the
+#       texts it writes, and damage it must survive. The camera files are tests/run.py's,
+#       compared with ExifTool.
+#
+#==============================================================================================
+
+## A little-endian TIFF stream under construction: entries of IFD0 and of one EXIF
+## directory, values that do not fit inline placed after the directories.
+struct Builder:
+    var bytes: u8[1024]
+    var length: usize
+
+    func put(value: u64, width: usize):
+        for i in 0..<width:
+            self.bytes[self.length] = (u8)((value >> (8 * (u64)i)) & 0xff)
+            self.length += 1
+
+    func put_at(at: usize, value: u64, width: usize):
+        for i in 0..<width:
+            self.bytes[at + i] = (u8)((value >> (8 * (u64)i)) & 0xff)
+
+    func text(value: str):
+        for byte in value.bytes:
+            self.bytes[self.length] = byte
+            self.length += 1
+        self.bytes[self.length] = 0
+        self.length += 1
+
+    func view() -> const u8[]:
+        return self.bytes[..<self.length]
+
+## A TIFF with Make, Model, Orientation 6, an EXIF directory (exposure 1/250, f/2.8,
+## ISO 400, original date, offset +02:00, lens) and a GPS directory.
+func sample_tiff(out: Builder*):
+    out.length = 0
+    out.put(0x4949, 2)
+    out.put(42, 2)
+    out.put(8, 4)
+    # IFD0 at 8: 5 entries, next 0. Values at 200 on.
+    out.put(5, 2)
+    let ifd0 = out.length
+    out.length += 5 * 12 + 4
+    let exif_at = out.length
+    out.put(7, 2)
+    let exif_entries = out.length
+    out.length += 7 * 12 + 4
+    let gps_at = out.length
+    out.put(4, 2)
+    let gps_entries = out.length
+    out.length += 4 * 12 + 4
+    # Values.
+    let make_at = out.length
+    out.text("Leica Camera AG")
+    let model_at = out.length
+    out.text("LEICA M11")
+    let time_at = out.length
+    out.put(1, 4)
+    out.put(250, 4)
+    let number_at = out.length
+    out.put(28, 4)
+    out.put(10, 4)
+    let date_at = out.length
+    out.text("2024:06:01 12:30:45")
+    let lens_at = out.length
+    out.text("Summilux-M 1:1.4/35 ASPH.")
+    let latitude_at = out.length
+    for value in [48, 1, 51, 1, 30, 1]:
+        out.put((u64)value, 4)
+    let longitude_at = out.length
+    for value in [2, 1, 17, 1, 0, 1]:
+        out.put((u64)value, 4)
+    # IFD0 entries: tag, type, count, value.
+    var at = ifd0
+    for (tag, kind, count, value) in [(0x010f, 2, 16, (i64)make_at), (0x0110, 2, 10, (i64)model_at), (0x0112, 3, 1, 6),
+                                      (0x8769, 4, 1, (i64)exif_at), (0x8825, 4, 1, (i64)gps_at)]:
+        out.put_at(at, (u64)tag, 2)
+        out.put_at(at + 2, (u64)kind, 2)
+        out.put_at(at + 4, (u64)count, 4)
+        out.put_at(at + 8, (u64)value, 4)
+        at += 12
+    at = exif_entries
+    for (tag, kind, count, value) in [(0x829a, 5, 1, (i64)time_at), (0x829d, 5, 1, (i64)number_at), (0x8827, 3, 1, 400),
+                                      (0x9003, 2, 20, (i64)date_at), (0x9011, 2, 7, 0x30303a32), (0x9291, 2, 3, 0x3432),
+                                      (0xa434, 2, 26, (i64)lens_at)]:
+        out.put_at(at, (u64)tag, 2)
+        out.put_at(at + 2, (u64)kind, 2)
+        out.put_at(at + 4, (u64)count, 4)
+        out.put_at(at + 8, (u64)value, 4)
+        at += 12
+    # The offset text "+02:00" does not fit inline: place it.
+    let offset_at = out.length
+    out.text("+02:00")
+    out.put_at(exif_entries + 4 * 12 + 8, (u64)offset_at, 4)
+    at = gps_entries
+    for (tag, kind, count, value) in [(1, 2, 2, 0x4e), (2, 5, 3, (i64)latitude_at), (3, 2, 2, 0x45), (4, 5, 3, (i64)longitude_at)]:
+        out.put_at(at, (u64)tag, 2)
+        out.put_at(at + 2, (u64)kind, 2)
+        out.put_at(at + 4, (u64)count, 4)
+        out.put_at(at + 8, (u64)value, 4)
+        at += 12
+
+test "a TIFF's camera, exposure, date, lens and GPS":
+    var tiff: Builder
+    sample_tiff(&tiff)
+    let found = try read(tiff.view())
+    defer found.release()
+    let m = found.value
+    assert(m.format == "TIFF")
+    assert(m.make == "Leica Camera AG")
+    assert(m.model == "LEICA M11")
+    assert(m.orientation == 6)
+    assert(m.shutter == "1/250")
+    assert(m.exposure_time == 0.004)
+    assert(m.f_number == 2.8)
+    assert(m.iso == 400)
+    assert(m.captured == "2024-06-01T12:30:45")
+    assert(m.offset == "+02:00")
+    assert(m.subseconds == "24")
+    # 2024-06-01 10:30:45 UTC.
+    assert(m.captured_unix == 1717237845)
+    assert(m.lens == "Summilux-M 1:1.4/35 ASPH.")
+    assert(m.has_gps)
+    assert(m.latitude > 48.8583 and m.latitude < 48.8584)
+    assert(m.longitude > 2.2833 and m.longitude < 2.2834)
+
+test "damage anywhere after the header is skipped, never trapped on":
+    var tiff: Builder
+    sample_tiff(&tiff)
+    var copy: u8[1024]
+    for cut in 8..<tiff.length:
+        # Truncate, and separately flip every byte: neither may trap.
+        survive(tiff.bytes[..<cut])
+        memory.copy(copy, tiff.bytes, tiff.length)
+        copy[cut] = copy[cut] ^ 0xff
+        survive(copy[..<tiff.length])
+
+## Read `data` and let go of the result, whatever it is.
+func survive(data: const u8[]):
+    let found = read(data) else return
+    found.release()
+
+test "a JPEG's EXIF and XMP rating and label":
+    var tiff: Builder
+    sample_tiff(&tiff)
+    var jpeg: u8[2048]
+    var at: usize = 0
+    for byte in b"\xff\xd8\xff\xe1":
+        jpeg[at] = byte
+        at += 1
+    let exif_length = tiff.length + 8
+    jpeg[at] = (u8)(exif_length >> 8)
+    jpeg[at + 1] = (u8)(exif_length & 0xff)
+    at += 2
+    for byte in b"Exif\x00\x00":
+        jpeg[at] = byte
+        at += 1
+    memory.copy(jpeg[at..], tiff.bytes, tiff.length)
+    at += tiff.length
+    let xmp = b"http://ns.adobe.com/xap/1.0/\x00<x:xmpmeta><rdf:Description xmp:Rating='4' xmp:Label='Red'/></x:xmpmeta>"
+    jpeg[at] = 0xff
+    jpeg[at + 1] = 0xe1
+    jpeg[at + 2] = (u8)((xmp.length + 2) >> 8)
+    jpeg[at + 3] = (u8)((xmp.length + 2) & 0xff)
+    at += 4
+    memory.copy(jpeg[at..], xmp, xmp.length)
+    at += xmp.length
+    for byte in b"\xff\xda\x00\x02\xff\xd9":
+        jpeg[at] = byte
+        at += 1
+    let found = try read(jpeg[..<at])
+    defer found.release()
+    assert(found.value.format == "JPEG")
+    assert(found.value.model == "LEICA M11")
+    assert(found.value.rating == 4)
+    assert(found.value.label == "Red")
+
+test "shutter, lens and date texts":
+    var buffer: u8[64]
+    assert((format_shutter(1.0 / 45.0, buffer) else "") == "1/45")
+    assert((format_shutter(0.3, buffer) else "") == "0.3s")
+    assert((format_shutter(2.5, buffer) else "") == "2.5s")
+    assert((format_shutter(30.0, buffer) else "") == "30s")
+    assert((format_shutter(1.0 / 8000.0, buffer) else "") == "1/8000")
+    let prime: f64[4] = [35.0, 35.0, 1.4, 1.4]
+    assert((format_lens(prime, buffer) else "") == "35mm f/1.4")
+    let zoom: f64[4] = [18.0, 55.0, 2.8, 4.0]
+    assert((format_lens(zoom, buffer) else "") == "18-55mm f/2.8-4")
+    assert(days_from_civil(1970, 1, 1) == 0)
+    assert(days_from_civil(2000, 3, 1) == 11017)
+    assert(unix_time("2021-05-15T13:04:45", "+01:00") == 1621080285)
+
+test "unknown bytes are refused":
+    let refused = read(b"hello, world") catch failure:
+        assert(failure.code == unrecognized)
+        return
+    refused.release()
+    assert(false, "plain text was read as metadata")

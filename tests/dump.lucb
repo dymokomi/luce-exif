@@ -1,0 +1,53 @@
+## The driver tests/run.py builds: `dump FILE...` prints each file's metadata, one
+## `key<TAB>value` line per field and a blank line after each file, for the checks to
+## compare with ExifTool.
+import c
+from luce_std import files
+from luce_exif import exif
+
+func show(path: c.str) -> !:
+    let data = try files.read(path)
+    defer data.release()
+    let found = try exif.read(data.value)
+    defer found.release()
+    let m = found.value
+    print(f"format\t{m.format}")
+    print(f"make\t{m.make}")
+    print(f"model\t{m.model}")
+    print(f"lens\t{m.lens}")
+    print(f"serial\t{m.serial}")
+    print(f"software\t{m.software}")
+    print(f"captured\t{m.captured}")
+    print(f"subseconds\t{m.subseconds}")
+    print(f"offset\t{m.offset}")
+    print(f"captured_unix\t{m.captured_unix}")
+    print(f"exposure_time\t{m.exposure_time}")
+    print(f"shutter\t{m.shutter}")
+    print(f"f_number\t{m.f_number}")
+    print(f"iso\t{m.iso}")
+    print(f"exposure_bias\t{m.exposure_bias}")
+    print(f"focal_length\t{m.focal_length}")
+    print(f"focal_length_35\t{m.focal_length_35}")
+    print(f"flash\t{m.flash}")
+    print(f"metering\t{m.metering}")
+    print(f"exposure_program\t{m.exposure_program}")
+    print(f"orientation\t{m.orientation}")
+    print(f"width\t{m.width}")
+    print(f"height\t{m.height}")
+    print(f"has_gps\t{m.has_gps}")
+    print(f"latitude\t{m.latitude}")
+    print(f"longitude\t{m.longitude}")
+    print(f"altitude\t{m.altitude}")
+    print(f"rating\t{m.rating}")
+    print(f"label\t{m.label}")
+    print(f"film_simulation\t{m.film_simulation}")
+    print("")
+
+pub func main(arguments: c.str[]) -> i32:
+    var status: i32 = 0
+    for path in arguments[1..]:
+        show(path) catch failure:
+            print(f"error\t{failure.message}")
+            print("")
+            status = 1
+    return status

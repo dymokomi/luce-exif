@@ -1,0 +1,163 @@
+#==============================================================================================
+#
+#   exif/tiff - TIFF image file directories and their entries
+#
+#   DESCRIPTION:
+#       EXIF is TIFF: a header naming the byte order, then directories of twelve-byte
+#       entries whose values sit inline (four bytes or fewer) or at an offset. Offsets count
+#       from the TIFF header, which inside a JPEG, a RAF or an ISO box is not the start of
+#       the file; a Directory carries that base. Nothing here trusts the file: a directory
+#       or a value that does not fit is answered as none and the caller moves on.
+#
+#==============================================================================================
+
+## Bytes per value of each TIFF field type (1 BYTE ... 13 IFD); zero marks an unknown type.
+let type_widths: u64[14] = [0, 1, 1, 2, 4, 8, 1, 1, 2, 4, 8, 4, 8, 4]
+
+## The most entries a directory may claim; real ones hold a few hundred at most.
+let most_entries: u64 = 1024
+
+## One tag's values in the file.
+struct Entry:
+    var tag: u64
+    var kind: u64
+    var count: u64
+    var data: const u8[]
+    var little: bool
+
+    ## Value `index` as an unsigned integer: signed types reinterpret, reals truncate.
+    func uint(index: u64) -> u64?:
+        if self.kind == 5 or self.kind == 10 or self.kind == 11 or self.kind == 12:
+            let value = self.real(index) else return none
+            return (u64)value if value > 0.0 else 0
+        if index >= self.count:
+            return none
+        let width = type_widths[(usize)self.kind]
+        return uint_at(self.data, index * width, width, self.little)
+
+    ## Value `index` as a signed integer.
+    func int(index: u64) -> i64?:
+        let value = self.uint(index) else return none
+        if self.kind == 6:
+            return (i64)(i8)(u8)value
+        if self.kind == 8:
+            return (i64)(i16)(u16)value
+        if self.kind == 9:
+            return (i64)(i32)(u32)value
+        return (i64)value
+
+    ## Value `index` as a real: rationals divide, floats convert, integers widen. A
+    ## rational with a zero denominator is none, as EXIF writes "unknown".
+    func real(index: u64) -> f64?:
+        if index >= self.count:
+            return none
+        let width = type_widths[(usize)self.kind]
+        let at = index * width
+        if self.kind == 5 or self.kind == 10:
+            let top = u32_at(self.data, at, self.little) else return none
+            let bottom = u32_at(self.data, at + 4, self.little) else return none
+            if bottom == 0:
+                return none
+            if self.kind == 10:
+                return (f64)(i32)(u32)top / (f64)(i32)(u32)bottom
+            return (f64)top / (f64)bottom
+        if self.kind == 11:
+            return (f64)f32.bits((u32)(u32_at(self.data, at, self.little) else return none))
+        if self.kind == 12:
+            return f64.bits(uint_at(self.data, at, 8, self.little) else return none)
+        let value = self.int(index) else return none
+        return (f64)value
+
+    ## The values as text: up to the first NUL, trimmed; "" when not valid UTF-8.
+    func text() -> str:
+        return clean_text(self.data)
+
+## One directory: `count` entries at absolute `offset` of `file`, whose value offsets
+## count from `base`, the position of its TIFF header.
+struct Directory:
+    var file: const u8[]
+    var base: u64
+    var offset: u64
+    var count: u64
+    var little: bool
+
+    ## The directory at `relative` (from `base`), or none when it does not fit the file.
+    static func open(file: const u8[], base: u64, relative: u64, little: bool) -> Directory?:
+        if relative == 0:
+            return none
+        let offset = base +? relative else return none
+        let count = u16_at(file, offset, little) else return none
+        if count == 0 or count > most_entries:
+            return none
+        let size = 2 + count * 12
+        _ = span(file, offset, size) else return none
+        return Directory(file = file, base = base, offset = offset, count = count, little = little)
+
+    ## Entry `index` with its values located, or none when they lie outside the file.
+    func entry(index: u64) -> Entry?:
+        let at = self.offset + 2 + index * 12
+        let tag = u16_at(self.file, at, self.little) else return none
+        let kind = u16_at(self.file, at + 2, self.little) else return none
+        let count = u32_at(self.file, at + 4, self.little) else return none
+        if kind >= 14 or type_widths[(usize)kind] == 0:
+            return none
+        let bytes = count *? type_widths[(usize)kind] else return none
+        if bytes <= 4:
+            let inline = span(self.file, at + 8, bytes) else return none
+            return Entry(tag = tag, kind = kind, count = count, data = inline, little = self.little)
+        let relative = u32_at(self.file, at + 8, self.little) else return none
+        let start = self.base +? relative else return none
+        let values = span(self.file, start, bytes) else return none
+        return Entry(tag = tag, kind = kind, count = count, data = values, little = self.little)
+
+    ## The entry for `tag`, or none when the directory lacks it or it is unreadable.
+    func find(tag: u64) -> Entry?:
+        for index in 0..<self.count:
+            let at = self.offset + 2 + index * 12
+            let found = u16_at(self.file, at, self.little) else return none
+            if found == tag:
+                return self.entry(index)
+        return none
+
+    ## The first value of `tag` as an unsigned integer.
+    func uint(tag: u64) -> u64?:
+        let found = self.find(tag) else return none
+        return found.uint(0)
+
+    ## The first value of `tag` as a real.
+    func real(tag: u64) -> f64?:
+        let found = self.find(tag) else return none
+        return found.real(0)
+
+    ## The text of `tag`, "" when absent.
+    func text(tag: u64) -> str:
+        let found = self.find(tag) else return ""
+        return found.text()
+
+    ## The directory a pointer tag (EXIF, GPS, SubIFD, ...) of this one names.
+    func child(relative: u64) -> Directory?:
+        return Directory.open(self.file, self.base, relative, self.little)
+
+    ## The next directory in the chain, or none at its end.
+    func next() -> Directory?:
+        let link = u32_at(self.file, self.offset + 2 + self.count * 12, self.little) else return none
+        if link == 0:
+            return none
+        let next_offset = self.base +? link else return none
+        # A chain that points back at or before itself would loop.
+        if next_offset <= self.offset:
+            return none
+        return Directory.open(self.file, self.base, link, self.little)
+
+## A TIFF header at `start` of `file`: its byte order, its magic and the first directory.
+## The magic is 42 for TIFF and its raws, 0x4f52 or 0x5352 for Olympus, 0x55 for
+## Panasonic.
+func tiff_header(file: const u8[], start: u64) -> Directory?:
+    let little = has_at(file, start, b"II")
+    if not little and not has_at(file, start, b"MM"):
+        return none
+    let magic = u16_at(file, start + 2, little) else return none
+    if magic != 42 and magic != 0x4f52 and magic != 0x5352 and magic != 0x55:
+        return none
+    let first = u32_at(file, start + 4, little) else return none
+    return Directory.open(file, start, first, little)

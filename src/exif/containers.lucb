@@ -1,0 +1,159 @@
+#==============================================================================================
+#
+#   exif/containers - Finding the metadata: TIFF raws, JPEG, Fujifilm RAF and PNG
+#
+#   DESCRIPTION:
+#       Each container keeps EXIF somewhere else. TIFF-based raws are a TIFF stream from
+#       byte zero. A JPEG keeps one in its "Exif" APP1 segment and XMP in another APP1.
+#       A RAF starts with Fujifilm's header (the camera's name, then the offset of a JPEG
+#       whose EXIF describes the shot). A PNG has an eXIf chunk and XMP in an iTXt
+#       chunk. ISO media files (CR3, HEIF) are media.lucb.
+#
+#==============================================================================================
+
+## The most JPEG segments or PNG chunks walked before giving up.
+let most_segments: usize = 4096
+
+## Fill `draft` from the container `data` is.
+func read_container(draft: Draft*, data: const u8[]) -> !:
+    if has_at(data, 0, b"FUJIFILMCCD-RAW "):
+        draft.format = "RAF"
+        try read_raf(draft, data)
+    elif has_at(data, 0, b"\xff\xd8\xff"):
+        draft.format = "JPEG"
+        if not read_jpeg(draft, data):
+            error(truncated, "the JPEG ends before its metadata")
+    elif has_at(data, 0, b"\x89PNG\r\n\x1a\n"):
+        draft.format = "PNG"
+        read_png(draft, data)
+    elif has_at(data, 4, b"ftyp"):
+        try read_media(draft, data)
+    elif has_at(data, 0, b"II") or has_at(data, 0, b"MM"):
+        if not read_tiff(draft, data, 0):
+            error(truncated, "the TIFF ends before its first directory")
+        name_tiff(draft, data)
+    else:
+        error(unrecognized, "not a TIFF, raw, JPEG, HEIF or PNG file")
+
+## The raw format of a TIFF-based file, from its magic and its maker.
+func name_tiff(draft: Draft*, data: const u8[]):
+    if draft.format.length > 0:
+        return
+    let magic = u16_at(data, 2, has_at(data, 0, b"II")) else 0
+    if magic == 0x4f52 or magic == 0x5352:
+        draft.format = "ORF"
+    elif magic == 0x55:
+        draft.format = "RW2"
+    elif has_at(data, 8, b"CR"):
+        draft.format = "CR2"
+    elif starts_with(draft.make, "NIKON"):
+        draft.format = "NEF"
+    elif starts_with(draft.make, "SONY"):
+        draft.format = "ARW"
+    elif starts_with(draft.make, "PENTAX") or starts_with(draft.make, "RICOH"):
+        draft.format = "PEF"
+    elif starts_with(draft.make, "OLYMPUS") or starts_with(draft.make, "OM Digital"):
+        draft.format = "ORF"
+    else:
+        draft.format = "TIFF"
+
+func starts_with(text: str, prefix: str) -> bool:
+    return has_at(text.bytes, 0, prefix.bytes)
+
+# mark: JPEG ==================================================================================
+
+## Walk a JPEG's segments up to its first scan: the EXIF APP1, the XMP APP1 and the
+## frame's size. False
+## when no segment could be read at all.
+func read_jpeg(draft: Draft*, data: const u8[]) -> bool:
+    var at: u64 = 2
+    var walked: usize = 0
+    while walked < most_segments:
+        walked += 1
+        let marker = uint_at(data, at, 2, false) else return walked > 1
+        if marker & 0xff00 != 0xff00:
+            return walked > 1
+        let kind = marker & 0xff
+        # Fill bytes and markers without a length.
+        if kind == 0xff:
+            at += 1
+            continue
+        if kind == 0xd8 or kind == 0x01 or (kind >= 0xd0 and kind <= 0xd7):
+            at += 2
+            continue
+        if kind == 0xda or kind == 0xd9:
+            return true
+        let length = uint_at(data, at + 2, 2, false) else return walked > 1
+        if length < 2:
+            return walked > 1
+        let body = span(data, at + 4, length - 2) else return walked > 1
+        if kind == 0xe1:
+            read_app1(draft, data, at + 4, body)
+        elif kind >= 0xc0 and kind <= 0xcf and kind != 0xc4 and kind != 0xc8 and kind != 0xcc:
+            # A frame header: precision, then height and width.
+            let height = uint_at(body, 1, 2, false) else 0
+            let width = uint_at(body, 3, 2, false) else 0
+            draft.size((i64)width, (i64)height)
+        at += 2 + length
+    return true
+
+## An APP1 segment at `start` of `data`: EXIF ("Exif\0\0" then TIFF) or XMP.
+func read_app1(draft: Draft*, data: const u8[], start: u64, body: const u8[]):
+    if has_at(body, 0, b"Exif\x00\x00") or has_at(body, 0, b"Exif\x00\xff"):
+        _ = read_tiff(draft, data, start + 6)
+    elif has_at(body, 0, b"http://ns.adobe.com/xap/1.0/\x00"):
+        read_xmp(draft, body[29..])
+
+# mark: Fujifilm RAF ==========================================================================
+
+## A RAF: the camera's name at byte 28 (32 bytes), the embedded JPEG's offset and length
+## at bytes 84 and 88, and the offset of Fujifilm's RAF directory at byte 92, all
+## big-endian.
+func read_raf(draft: Draft*, data: const u8[]) -> !:
+    let jpeg_at = be32(data, 84) else error(truncated, "the RAF header is cut short")
+    let jpeg_length = be32(data, 88) else error(truncated, "the RAF header is cut short")
+    if let jpeg = span(data, jpeg_at, jpeg_length):
+        _ = read_jpeg(draft, jpeg)
+    if let name = span(data, 28, 32):
+        draft.first_text(&draft.model, clean_text(name))
+    draft.first_text(&draft.make, "FUJIFILM")
+    if let directory = be32(data, 92):
+        read_raf_directory(draft, data, directory)
+
+## The RAF directory: a count, then records of a tag, a length and the bytes. 0x111 is
+## the raw image's cropped size, the size a developed RAF has (height, then width).
+func read_raf_directory(draft: Draft*, data: const u8[], start: u64):
+    let count = be32(data, start) else return
+    var at = start + 4
+    var index: u64 = 0
+    while index < count and index < 256:
+        index += 1
+        let tag = uint_at(data, at, 2, false) else return
+        let length = uint_at(data, at + 2, 2, false) else return
+        if tag == 0x111 and length == 4:
+            let height = uint_at(data, at + 4, 2, false) else return
+            let width = uint_at(data, at + 6, 2, false) else return
+            draft.size((i64)width, (i64)height)
+            return
+        at += 4 + length
+
+# mark: PNG ===================================================================================
+
+## Walk a PNG's chunks: eXIf holds a TIFF stream, iTXt "XML:com.adobe.xmp" the XMP.
+func read_png(draft: Draft*, data: const u8[]):
+    var at: u64 = 8
+    var walked: usize = 0
+    while walked < most_segments:
+        walked += 1
+        let length = be32(data, at) else return
+        let body = span(data, at + 8, length) else return
+        if has_at(data, at + 4, b"eXIf"):
+            _ = read_tiff(draft, data, at + 8)
+        elif has_at(data, at + 4, b"iTXt") and has_at(body, 0, b"XML:com.adobe.xmp\x00"):
+            # keyword, NUL, compression flag and method, language and translated keyword,
+            # each NUL-terminated; uncompressed text follows.
+            if body.length > 19 and body[18] == 0:
+                read_xmp(draft, body[19..])
+        elif has_at(data, at + 4, b"IEND"):
+            return
+        at += 12 + length

@@ -1,0 +1,129 @@
+#==============================================================================================
+#
+#   exif/dates - EXIF dates as ISO 8601 and Unix time; the shutter and lens as text
+#
+#   DESCRIPTION:
+#       EXIF writes "YYYY:MM:DD HH:MM:SS" in the camera's local time and, since EXIF 2.31,
+#       the offset from UTC beside it. A library sorts by the moment, so the date becomes
+#       ISO 8601 text and seconds since 1970 (Howard Hinnant's days_from_civil). The
+#       texts are written into the Draft's buffers with `strings.format`.
+#
+#==============================================================================================
+
+## The `count` digits at `at` of `text` as a number, or none.
+func digits(text: const u8[], at: usize, count: usize) -> i64?:
+    if at + count > text.length:
+        return none
+    var value: i64 = 0
+    for i in at..<at + count:
+        let byte = text[i]
+        if byte < '0' or byte > '9':
+            return none
+        value = value * 10 + (i64)(byte - '0')
+    return value
+
+## The date and time of an EXIF date text: year, month, day, hour, minute, second.
+## Dashes are accepted for the date's colons; seconds may be missing.
+func date_parts(text: str) -> (i64, i64, i64, i64, i64, i64)?:
+    let bytes = text.bytes
+    let year = digits(bytes, 0, 4) else return none
+    let month = digits(bytes, 5, 2) else return none
+    let day = digits(bytes, 8, 2) else return none
+    let hour = digits(bytes, 11, 2) else return none
+    let minute = digits(bytes, 14, 2) else return none
+    let second = digits(bytes, 17, 2) else 0
+    if year < 1800 or month < 1 or month > 12 or day < 1 or day > 31 or hour > 24 or minute > 59 or second > 60:
+        return none
+    return (year, month, day, hour, minute, second)
+
+## "YYYY-MM-DDTHH:MM:SS" of the first readable date among `dates`, into `buffer`.
+func format_captured(original: str, digitized: str, changed: str, buffer: u8[]) -> str?:
+    let parts = date_parts(original) else date_parts(digitized) else date_parts(changed) else return none
+    let (year, month, day, hour, minute, second) = parts
+    return strings.format(buffer, f"{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}") catch failure:
+        recover none
+
+## Days from 1970-01-01 to the civil date (proleptic Gregorian).
+func days_from_civil(year: i64, month: i64, day: i64) -> i64:
+    let y = year - 1 if month <= 2 else year
+    let era = (y if y >= 0 else y - 399) // 400
+    let year_of_era = y - era * 400
+    let shifted = month - 3 if month > 2 else month + 9
+    let day_of_year = (153 * shifted + 2) // 5 + day - 1
+    let day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+    return era * 146097 + day_of_era - 719468
+
+## Seconds since 1970 UTC of `captured` ("YYYY-MM-DDTHH:MM:SS"), less `offset`
+## ("+HH:MM") when there is one.
+func unix_time(captured: str, offset: str) -> i64:
+    let (year, month, day, hour, minute, second) = date_parts(captured) else return 0
+    var seconds = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second
+    let bytes = offset.bytes
+    if bytes.length >= 6 and (bytes[0] == '+' or bytes[0] == '-'):
+        let hours = digits(bytes, 1, 2) else 0
+        let minutes = digits(bytes, 4, 2) else 0
+        let shift = hours * 3600 + minutes * 60
+        seconds = seconds - shift if bytes[0] == '+' else seconds + shift
+    return seconds
+
+## An EXIF offset text ("+02:00") when it is one, else "".
+func clean_offset(text: str) -> str:
+    let bytes = text.bytes
+    if bytes.length != 6 or not (bytes[0] == '+' or bytes[0] == '-') or bytes[3] != ':':
+        return ""
+    _ = digits(bytes, 1, 2) else return ""
+    _ = digits(bytes, 4, 2) else return ""
+    return text
+
+## The shutter as photographers write it: "1/250" under a second (the nearest
+## reciprocal, so 0.0222 s is 1/45), whole seconds "2s", else "2.5s".
+func format_shutter(seconds: f64, buffer: u8[]) -> str?:
+    if not (seconds > 0.0) or seconds > 1.0e6:
+        return none
+    if seconds < 1.0:
+        let reciprocal = (i64)math.round(1.0 / seconds)
+        # Between a half and one second the reciprocal rounds to 1 or 2: "0.6s" says it.
+        if reciprocal >= 2 and math.abs(1.0 / (f64)reciprocal - seconds) <= seconds * 0.06:
+            return strings.format(buffer, f"1/{reciprocal}") catch failure:
+                recover none
+    let tenths = (i64)math.round(seconds * 10.0)
+    if tenths % 10 == 0:
+        return strings.format(buffer, f"{tenths // 10}s") catch failure:
+            recover none
+    return strings.format(buffer, f"{tenths // 10}.{tenths % 10}s") catch failure:
+        recover none
+
+## A lens's name from its range (shortest and longest focal length, then the widest
+## apertures at each): "35mm f/1.4", "24-70mm f/2.8", "18-55mm f/2.8-4".
+func format_lens(range: f64[4], buffer: u8[]) -> str?:
+    if not (range[0] > 0.0):
+        return none
+    let short = (i64)math.round(range[0])
+    let long = (i64)math.round(range[1]) if range[1] > range[0] else short
+    var at = put(buffer, 0, f"{short}") else return none
+    if long != short:
+        at = put(buffer, at, f"-{long}") else return none
+    at = put(buffer, at, "mm") else return none
+    var number: u8[16]
+    if range[2] > 0.0:
+        let wide = aperture_text(range[2], number) else return none
+        at = put(buffer, at, f" f/{wide}") else return none
+        if range[3] > range[2] + 0.05:
+            let narrow = aperture_text(range[3], number) else return none
+            at = put(buffer, at, f"-{narrow}") else return none
+    return (str)buffer[..<at]
+
+## Write `text` at `at` of `buffer`; where it ends, or none when it does not fit.
+func put(buffer: u8[], at: usize, text: fmt) -> usize?:
+    let written = strings.format(buffer[at..], text) catch failure:
+        return none
+    return at + written.length
+
+## An f-number as the lens barrel prints it: "2", "2.8".
+func aperture_text(value: f64, buffer: u8[]) -> str?:
+    let tenths = (i64)math.round(value * 10.0)
+    if tenths % 10 == 0:
+        return strings.format(buffer, f"{tenths // 10}") catch failure:
+            recover none
+    return strings.format(buffer, f"{tenths // 10}.{tenths % 10}") catch failure:
+        recover none

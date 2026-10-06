@@ -1,0 +1,73 @@
+#==============================================================================================
+#
+#   exif/bytes - Bounds-checked reads from a byte view
+#
+#   DESCRIPTION:
+#       Every number this package takes from a file comes through these readers. They take a
+#       position and a width and answer none when the bytes are not there, so a lying offset
+#       becomes a skipped field, never a trap. Byte order is chosen per read.
+#
+#==============================================================================================
+
+## The `count` bytes at `at` of `data`, or none when they run past its end.
+func span(data: const u8[], at: u64, count: u64) -> const u8[]?:
+    let end = at +? count else return none
+    if end > (u64)data.length:
+        return none
+    return data[(usize)at..<(usize)end]
+
+## The unsigned integer of `width` bytes (1, 2, 4 or 8) at `at`, little- or big-endian.
+func uint_at(data: const u8[], at: u64, width: u64, little: bool) -> u64?:
+    let bytes = span(data, at, width) else return none
+    var value: u64 = 0
+    for i in 0..<bytes.length:
+        let byte = (u64)bytes[bytes.length - 1 - i if little else i]
+        value = (value << 8) | byte
+    return value
+
+func u16_at(data: const u8[], at: u64, little: bool) -> u64?:
+    return uint_at(data, at, 2, little)
+
+func u32_at(data: const u8[], at: u64, little: bool) -> u64?:
+    return uint_at(data, at, 4, little)
+
+## Big-endian 32-bit, as ISO media and RAF headers store their sizes.
+func be32(data: const u8[], at: u64) -> u64?:
+    return uint_at(data, at, 4, false)
+
+## Whether `data` holds `pattern` at `at`.
+func has_at(data: const u8[], at: u64, pattern: const u8[]) -> bool:
+    let found = span(data, at, (u64)pattern.length) else return false
+    for i in 0..<pattern.length:
+        if found[i] != pattern[i]:
+            return false
+    return true
+
+## The first position at or after `from_at` where `pattern` starts, or none.
+func find_bytes(data: const u8[], from_at: usize, pattern: const u8[]) -> usize?:
+    if pattern.length == 0 or data.length < pattern.length:
+        return none
+    var at = from_at
+    let last = data.length - pattern.length
+    while at <= last:
+        if data[at] == pattern[0] and has_at(data, (u64)at, pattern):
+            return at
+        at += 1
+    return none
+
+## `bytes` as text when they are valid UTF-8, with NULs and spaces trimmed from both
+## ends; "" otherwise. Maker strings are ASCII, padded with NULs or spaces.
+func clean_text(bytes: const u8[]) -> str:
+    var start: usize = 0
+    var end = bytes.length
+    # Text stops at the first NUL.
+    for i in 0..<bytes.length:
+        if bytes[i] == 0:
+            end = i
+            break
+    while start < end and (bytes[start] == ' ' or bytes[start] == '\t'):
+        start += 1
+    while end > start and (bytes[end - 1] == ' ' or bytes[end - 1] == '\t' or bytes[end - 1] == '\n' or bytes[end - 1] == '\r'):
+        end -= 1
+    return str(bytes[start..<end]) catch failure:
+        recover ""

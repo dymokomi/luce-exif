@@ -1,0 +1,131 @@
+#==============================================================================================
+#
+#   exif/draft - The fields as they are found, then the owned result
+#
+#   DESCRIPTION:
+#       Reading fills a Draft. Its texts are views of the file, of static text, or of the
+#       Draft's own buffers for those this package writes (the date, the shutter, a lens
+#       made from its ranges), so they last for the call only. The first source of a field
+#       wins: IFD0 before a later directory, the EXIF directory before a maker note.
+#       `finish` copies every text into one allocation that an ownership object frees,
+#       and hands the Metadata out with that owner, as luce-std's owned results do.
+#
+#==============================================================================================
+
+
+struct Draft:
+    var format: str
+    var make: str
+    var model: str
+    var lens: str
+    var serial: str
+    var software: str
+    var subseconds: str
+    var offset: str
+    var label: str
+    var film_simulation: str
+    ## The EXIF dates, "YYYY:MM:DD HH:MM:SS": original, digitized, file changed.
+    var date_original: str
+    var date_digitized: str
+    var date_changed: str
+    ## The lens's focal and aperture range (DNG LensInfo, EXIF LensSpecification).
+    var lens_range: f64[4]
+    var exposure_time: f64
+    var f_number: f64
+    var iso: i64
+    var exposure_bias: f64
+    var focal_length: f64
+    var focal_length_35: i64
+    var flash: bool
+    var metering: i64
+    var exposure_program: i64
+    var orientation: i64
+    var width: i64
+    var height: i64
+    var has_gps: bool
+    var latitude: f64
+    var longitude: f64
+    var altitude: f64
+    var rating: i64
+    var rated: bool
+    ## Where written texts live until `finish` copies them.
+    var captured_buffer: u8[32]
+    var shutter_buffer: u8[32]
+    var lens_buffer: u8[64]
+
+    ## Keep `value` in `field` unless an earlier source filled it.
+    func first_text(field: str*, value: str):
+        if field.length == 0 and value.length > 0:
+            *field = value
+
+    ## The image size, kept when it is larger than what was found so far.
+    func size(width: i64, height: i64):
+        if width * height > self.width * self.height:
+            self.width = width
+            self.height = height
+
+    ## The Metadata with every text copied into storage it owns.
+    func finish() -> interop.Owned[Metadata]!:
+        let captured = format_captured(self.date_original, self.date_digitized, self.date_changed, self.captured_buffer) else ""
+        let shutter = format_shutter(self.exposure_time, self.shutter_buffer) else ""
+        var lens = self.lens
+        if lens.length == 0:
+            lens = format_lens(self.lens_range, self.lens_buffer) else ""
+        let texts: str[12] = [self.format, self.make, self.model, lens, self.serial, self.software, captured,
+                              self.subseconds, self.offset, shutter, self.label, self.film_simulation]
+        var total: usize = 0
+        for text in texts:
+            total += text.length
+        let owner = try new_storage(total)
+        var copies: str[12]
+        var at: usize = 0
+        for (index, text) in texts.indexed():
+            memory.copy(owner.data[at..<at + text.length], text.bytes, text.length)
+            copies[index] = (str)owner.data[at..<at + text.length]
+            at += text.length
+        var unix: i64 = 0
+        if captured.length > 0:
+            unix = unix_time(captured, copies[8])
+        let metadata = Metadata(format = copies[0], make = copies[1], model = copies[2], lens = copies[3],
+                                serial = copies[4], software = copies[5], captured = copies[6],
+                                subseconds = copies[7], offset = copies[8], captured_unix = unix,
+                                exposure_time = self.exposure_time, shutter = copies[9], f_number = self.f_number,
+                                iso = self.iso, exposure_bias = self.exposure_bias, focal_length = self.focal_length,
+                                focal_length_35 = self.focal_length_35, flash = self.flash, metering = self.metering,
+                                exposure_program = self.exposure_program,
+                                orientation = self.orientation if self.orientation >= 1 and self.orientation <= 8 else 1,
+                                width = self.width, height = self.height, has_gps = self.has_gps,
+                                latitude = self.latitude, longitude = self.longitude, altitude = self.altitude,
+                                rating = self.rating, label = copies[10], film_simulation = copies[11])
+        return interop.Owned[Metadata](metadata, &owner.header)
+
+# mark: Owned storage =========================================================================
+
+## The one allocation behind a Metadata's texts, freed by the allocator that made it.
+struct Storage:
+    var header: ownership.Object
+    var allocator: memory.Allocator
+    var data: u8[]
+
+func drop_storage(object: ownership.Object*):
+    let storage = (Storage*)object
+    with storage.allocator:
+        if storage.data.length > 0:
+            free(storage.data)
+
+func trace_storage(object: ownership.Object*, visit: func(ownership.Object*, void*) -> unit, context: void*):
+    _ = object
+
+var storage_info: ownership.Info = ownership.Info(name = "exif metadata", size = memory.size_of(Storage),
+                                                  finish = none, drop = drop_storage,
+                                                  trace = trace_storage, acyclic = true)
+
+## An owner holding `size` bytes of the current allocator.
+func new_storage(size: usize) -> Storage*!:
+    let storage = (Storage*)(try ownership.reserve(&storage_info, memory.size_of(Storage)))
+    storage.allocator = memory.allocator
+    if size > 0:
+        storage.data = new u8[size] catch failure:
+            ownership.release(&storage.header)
+            error(failure.code, failure.message)
+    return storage

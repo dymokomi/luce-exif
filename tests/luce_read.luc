@@ -1,0 +1,32 @@
+## Metadata crosses into Luce: a Luce program reads a fixture and gets owned texts and
+## numbers it can keep after the bytes are gone.
+from luce_exif import exif
+from luce_std import files
+
+func metadata(path: str) -> exif.Metadata!:
+    let data = files.read(path)
+    return exif.read(data)
+
+test "a Luce program reads a JPEG's metadata":
+    let m = metadata("tests/fixtures/camera.jpg")
+    assert(m.format == "JPEG")
+    assert(m.make == "FUJIFILM")
+    assert(m.model == "X100VI")
+    assert(m.lens == "FUJINON 23mm F2")
+    assert(m.captured == "2025-03-09T08:15:02")
+    assert(m.offset == "-05:00")
+    assert(m.captured_unix == 1741526102)
+    assert(m.shutter == "1/500")
+    assert(m.iso == 160)
+    assert(m.orientation == 8)
+    assert(m.has_gps)
+    assert(m.latitude < -33.86 and m.latitude > -33.87)
+    assert(m.rating == 3)
+    assert(m.label == "Green")
+    assert(m.width == 64)
+
+test "unknown bytes fail in Luce with the package's code":
+    let failed = exif.read(b"not an image") catch failure:
+        assert(failure.code == exif.unrecognized)
+        return
+    assert(failed.format == "", "plain text was read as metadata")

@@ -1,0 +1,38 @@
+name: Correctness
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: luce-exif
+      - uses: actions/checkout@v7
+        with:
+          repository: dymokomi/luce-base
+          path: luce-base
+      # every dependency at main, beside this checkout (luce-base docs/CI.md)
+      - name: Check out dependencies at main
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: |
+          python3 luce-base/tools/checkout_main.py luce-exif luce
+      - name: Select Clang
+        run: |
+          mkdir -p "$RUNNER_TEMP/luce-bin"
+          ln -s "$(command -v clang)" "$RUNNER_TEMP/luce-bin/cc"
+          echo "$RUNNER_TEMP/luce-bin" >> "$GITHUB_PATH"
+      - name: Build native compilers
+        run: |
+          (cd luce-base && ./build.sh)
+          (cd luce && LUCE_BASE_COMPILER=../luce-base/build/luce-base ./build.sh)
+      - name: Module tests, fixtures and the Luce crossing
+        working-directory: luce-exif
+        run: ./test.sh --base ../luce-base/build/luce-base --luce ../luce/build/luce

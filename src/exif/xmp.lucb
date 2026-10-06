@@ -1,0 +1,75 @@
+#==============================================================================================
+#
+#   exif/xmp - The rating and label from an XMP packet
+#
+#   DESCRIPTION:
+#       XMP is RDF/XML. A photo editor writes the rating and the color label either as
+#       attributes of rdf:Description (xmp:Rating="4") or as elements
+#       (<xmp:Rating>4</xmp:Rating>). This reads exactly those two properties by scanning
+#       for them; it is not an XML parser, and a packet that spells the xmp namespace
+#       with another prefix is not understood.
+#
+#==============================================================================================
+
+## Take the rating and label from `packet` when no earlier source gave them.
+func read_xmp(draft: Draft*, packet: const u8[]):
+    if not draft.rated:
+        if let text = xmp_value(packet, "xmp:Rating"):
+            if let rating = small_integer(text):
+                if rating >= -1 and rating <= 5:
+                    draft.rating = rating
+                    draft.rated = true
+    if draft.label.length == 0:
+        if let text = xmp_value(packet, "xmp:Label"):
+            draft.label = clean_text(text)
+
+## The value of property `name`: the attribute `name="..."` (or '...'), else the
+## element `<name>...</name>`.
+func xmp_value(packet: const u8[], name: str) -> const u8[]?:
+    var from_at: usize = 0
+    while let at = find_bytes(packet, from_at, name.bytes):
+        let after = at + name.length
+        from_at = after
+        # The name must not be the head of a longer one (xmp:RatingPercent).
+        if after >= packet.length:
+            return none
+        let next = packet[after]
+        if next == '=' and after + 1 < packet.length:
+            let quote = packet[after + 1]
+            if quote != '"' and quote != '\'':
+                continue
+            let start = after + 2
+            var end = start
+            while end < packet.length and packet[end] != quote:
+                end += 1
+            if end >= packet.length:
+                return none
+            return packet[start..<end]
+        if next == '>' and at > 0 and packet[at - 1] == '<':
+            let start = after + 1
+            var end = start
+            while end < packet.length and packet[end] != '<':
+                end += 1
+            return packet[start..<end]
+    return none
+
+## A small signed integer in `text` (spaces around it allowed), or none.
+func small_integer(text: const u8[]) -> i64?:
+    var at: usize = 0
+    while at < text.length and text[at] == ' ':
+        at += 1
+    var negative = false
+    if at < text.length and text[at] == '-':
+        negative = true
+        at += 1
+    var value: i64 = 0
+    var seen = false
+    while at < text.length and text[at] >= '0' and text[at] <= '9':
+        value = value * 10 + (i64)(text[at] - '0')
+        seen = true
+        at += 1
+        if value > 1000:
+            return none
+    if not seen:
+        return none
+    return -value if negative else value

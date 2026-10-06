@@ -1,0 +1,63 @@
+#==============================================================================================
+#
+#   exif/makernotes - The Fujifilm maker note's film simulation
+#
+#   DESCRIPTION:
+#       Fujifilm's maker note starts "FUJIFILM", then a little-endian offset to a TIFF
+#       directory whose offsets count from the note's own start. FilmMode (0x1401) names
+#       the color simulations; the monochrome ones are told by Saturation (0x1003)
+#       instead. Names are the ones the cameras' menus show. Other makers' notes are not
+#       read: what this package reports, the EXIF directory already says for them.
+#
+#==============================================================================================
+
+let fuji_saturation: u64 = 0x1003
+let fuji_film_mode: u64 = 0x1401
+
+## Read the maker note `note` (bytes of `file`), when it is one this package knows.
+func read_maker_note(draft: Draft*, file: const u8[], note: const u8[]):
+    _ = file
+    if has_at(note, 0, b"FUJIFILM"):
+        read_fujifilm(draft, note)
+
+func read_fujifilm(draft: Draft*, note: const u8[]):
+    let first = u32_at(note, 8, true) else return
+    let directory = Directory.open(note, 0, first, true) else return
+    if let saturation = directory.uint(fuji_saturation):
+        let monochrome = monochrome_name(saturation)
+        if monochrome.length > 0:
+            draft.first_text(&draft.film_simulation, monochrome)
+            return
+    if let mode = directory.uint(fuji_film_mode):
+        draft.first_text(&draft.film_simulation, film_name(mode))
+
+## The camera's name for a FilmMode value.
+func film_name(mode: u64) -> str:
+    return match mode:
+        0x000 => "Provia/Standard"
+        0x100, 0x110, 0x130, 0x300 => "Studio Portrait"
+        0x120 => "Astia/Soft"
+        0x200, 0x400 => "Velvia/Vivid"
+        0x500 => "Pro Neg. Std"
+        0x501 => "Pro Neg. Hi"
+        0x600 => "Classic Chrome"
+        0x700 => "Eterna/Cinema"
+        0x800 => "Classic Neg."
+        0x900 => "Eterna Bleach Bypass"
+        0xa00 => "Nostalgic Neg."
+        0xb00 => "Reala Ace"
+        _ => ""
+
+## The camera's name for a monochrome Saturation value, "" for a color one.
+func monochrome_name(saturation: u64) -> str:
+    return match saturation:
+        0x300 => "Monochrome"
+        0x301 => "Monochrome+R Filter"
+        0x302 => "Monochrome+Ye Filter"
+        0x303 => "Monochrome+G Filter"
+        0x310 => "Sepia"
+        0x500 => "Acros"
+        0x501 => "Acros+R Filter"
+        0x502 => "Acros+Ye Filter"
+        0x503 => "Acros+G Filter"
+        _ => ""

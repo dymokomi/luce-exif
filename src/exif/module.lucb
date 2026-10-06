@@ -1,0 +1,108 @@
+#==============================================================================================
+#
+#   exif - Photo metadata: EXIF, TIFF and XMP from camera raws, TIFF, JPEG, HEIF and PNG
+#
+#   DESCRIPTION:
+#       `read` takes a file's bytes, finds the TIFF directories its container keeps EXIF
+#       in, and answers what a photo library shows and sorts by: the camera and lens, when
+#       the picture was taken, how it was exposed, where (GPS), its orientation and size,
+#       and the rating and label an editor stored in XMP. Fujifilm files also name their
+#       film simulation. Every offset is checked; a part that is damaged or missing is
+#       skipped and its fields keep their zero values.
+#
+#       Fragments, in ORDER:
+#
+#       module.lucb       Metadata, the error codes and `read`
+#       bytes.lucb        bounds-checked reads from a byte view
+#       tiff.lucb         TIFF directories and entries
+#       tags.lucb         IFD0, the EXIF and GPS directories, sizes
+#       makernotes.lucb   the Fujifilm maker note's film simulation
+#       containers.lucb   sniffing; JPEG, RAF and PNG
+#       media.lucb        ISO media files: Canon CR3, HEIF/HEIC and AVIF
+#       xmp.lucb          rating and label from an XMP packet
+#       draft.lucb        the fields as they are found, then the owned result
+#       dates.lucb        EXIF dates to ISO 8601 and Unix time; shutter text
+#       tests.lucb        tests on hand-built files
+#
+#==============================================================================================
+
+import interop
+import memory
+import ownership
+import strings
+from luce_std import math
+
+## The bytes are no container this package knows.
+pub let unrecognized: ErrorCode = ErrorCode.package(1)
+## The container ends before its first metadata directory.
+pub let truncated: ErrorCode = ErrorCode.package(2)
+
+## What a photo's metadata says. Texts are "" and numbers 0 when the file does not say;
+## `orientation` is 1 then, and `rating` 0.
+pub struct Metadata:
+    ## The container: "DNG", "TIFF", "NEF", "ARW", "CR2", "CR3", "ORF", "RW2", "PEF",
+    ## "RAF", "JPEG", "HEIF", "AVIF" or "PNG".
+    pub let format: str
+    ## The camera's maker and model, as the camera writes them.
+    pub let make: str
+    pub let model: str
+    ## The lens's name: LensModel, else one made from the lens's focal and aperture
+    ## range ("35mm f/1.4", "24-70mm f/2.8").
+    pub let lens: str
+    ## The camera body's serial number.
+    pub let serial: str
+    ## The software that wrote the file.
+    pub let software: str
+    ## When the picture was taken, "YYYY-MM-DDTHH:MM:SS" in the camera's local time.
+    pub let captured: str
+    ## Fractions of the second, as digits ("24" for .24).
+    pub let subseconds: str
+    ## The local time's offset from UTC, "+02:00", or "" when the camera did not say.
+    pub let offset: str
+    ## Seconds since 1970 UTC when `offset` is known; otherwise the local time read as
+    ## if it were UTC. 0 when there is no date.
+    pub let captured_unix: i64
+    ## The exposure time in seconds, and the same as a photographer writes it: "1/250",
+    ## "2.5s".
+    pub let exposure_time: f64
+    pub let shutter: str
+    ## The aperture's f-number.
+    pub let f_number: f64
+    ## The ISO speed.
+    pub let iso: i64
+    ## Exposure compensation in EV.
+    pub let exposure_bias: f64
+    ## The focal length in millimetres, and its 35 mm equivalent (0 when not given).
+    pub let focal_length: f64
+    pub let focal_length_35: i64
+    ## Whether the flash fired.
+    pub let flash: bool
+    ## EXIF MeteringMode (1 average, 2 center-weighted, 3 spot, 5 multi-segment, ...)
+    ## and ExposureProgram (1 manual, 2 program, 3 aperture priority, 4 shutter
+    ## priority, ...); 0 unknown.
+    pub let metering: i64
+    pub let exposure_program: i64
+    ## EXIF orientation, 1 to 8.
+    pub let orientation: i64
+    ## The image's pixel size as the file states it (the main image for raws).
+    pub let width: i64
+    pub let height: i64
+    ## Where: signed decimal degrees (north and east positive), metres above sea level.
+    pub let has_gps: bool
+    pub let latitude: f64
+    pub let longitude: f64
+    pub let altitude: f64
+    ## The XMP rating, 0 to 5, or -1 for rejected; and the XMP color label.
+    pub let rating: i64
+    pub let label: str
+    ## Fujifilm's film simulation ("Classic Chrome", "Acros+R Filter", ...), or "".
+    pub let film_simulation: str
+
+## The metadata of the file `data`. The result owns its texts: Luce copies them; a Base
+## caller reads `.value` and calls `release()` when done. Fails with `unrecognized`
+## when `data` is no supported container, and `truncated` when it ends before its first
+## directory; anything damaged after that is skipped.
+pub func read(data: const u8[]) -> interop.Owned[Metadata]!:
+    var draft: Draft
+    try read_container(&draft, data)
+    return try draft.finish()

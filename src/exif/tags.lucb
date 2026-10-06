@@ -1,0 +1,235 @@
+#==============================================================================================
+#
+#   exif/tags - What IFD0, the EXIF and the GPS directories say
+#
+#   DESCRIPTION:
+#       A TIFF stream's first directory (IFD0) names the camera and points at the EXIF and
+#       GPS directories; the chain after it and its SubIFDs hold thumbnails and, in raws,
+#       the full image, whose size is the largest found. Tag numbers are EXIF 3.0's, plus
+#       DNG's LensInfo and CameraSerialNumber.
+#
+#==============================================================================================
+
+# mark: Tags ==================================================================================
+
+## Panasonic and Leica RW2/RWL raws: the ISO in IFD0, and a JPEG whose EXIF directory
+## holds the rest of the exposure.
+let tag_panasonic_iso: u64 = 0x0017
+let tag_panasonic_jpeg: u64 = 0x002e
+let tag_new_subfile_type: u64 = 0x00fe
+let tag_width: u64 = 0x0100
+let tag_height: u64 = 0x0101
+let tag_make: u64 = 0x010f
+let tag_model: u64 = 0x0110
+let tag_orientation: u64 = 0x0112
+let tag_software: u64 = 0x0131
+let tag_date_time: u64 = 0x0132
+let tag_sub_ifds: u64 = 0x014a
+let tag_xmp: u64 = 0x02bc
+let tag_rating: u64 = 0x4746
+let tag_exif_ifd: u64 = 0x8769
+let tag_gps_ifd: u64 = 0x8825
+let tag_exposure_time: u64 = 0x829a
+let tag_f_number: u64 = 0x829d
+let tag_exposure_program: u64 = 0x8822
+let tag_iso: u64 = 0x8827
+let tag_recommended_index: u64 = 0x8832
+let tag_date_original: u64 = 0x9003
+let tag_date_digitized: u64 = 0x9004
+let tag_offset_original: u64 = 0x9011
+let tag_offset_time: u64 = 0x9010
+let tag_shutter_value: u64 = 0x9201
+let tag_aperture_value: u64 = 0x9202
+let tag_exposure_bias: u64 = 0x9204
+let tag_metering: u64 = 0x9207
+let tag_flash: u64 = 0x9209
+let tag_focal_length: u64 = 0x920a
+let tag_maker_note: u64 = 0x927c
+let tag_subsec_original: u64 = 0x9291
+let tag_pixel_width: u64 = 0xa002
+let tag_pixel_height: u64 = 0xa003
+let tag_focal_35: u64 = 0xa405
+let tag_body_serial: u64 = 0xa431
+let tag_lens_specification: u64 = 0xa432
+let tag_lens_model: u64 = 0xa434
+let tag_dng_version: u64 = 0xc612
+let tag_dng_lens_info: u64 = 0xc630
+let tag_dng_serial: u64 = 0xc62f
+let tag_default_crop_size: u64 = 0xc620
+
+## How many directories of a chain, and SubIFDs of one directory, are read.
+let most_chained: usize = 8
+let most_sub_ifds: u64 = 8
+
+# mark: Reading ===============================================================================
+
+## Read the TIFF stream whose header is at `start` of `file`; false when there is no
+## readable first directory there.
+func read_tiff(draft: Draft*, file: const u8[], start: u64) -> bool:
+    let first = tiff_header(file, start) else return false
+    read_ifd0(draft, &first)
+    var link = first.next()
+    var chained: usize = 1
+    while let directory = link:
+        if chained >= most_chained:
+            break
+        read_size(draft, &directory)
+        link = directory.next()
+        chained += 1
+    return true
+
+## The camera, the pointers to the EXIF and GPS directories, XMP and the image sizes.
+func read_ifd0(draft: Draft*, directory: const Directory*):
+    draft.first_text(&draft.make, directory.text(tag_make))
+    draft.first_text(&draft.model, directory.text(tag_model))
+    draft.first_text(&draft.software, directory.text(tag_software))
+    draft.first_text(&draft.date_changed, directory.text(tag_date_time))
+    draft.first_text(&draft.serial, directory.text(tag_dng_serial))
+    if draft.orientation == 0:
+        draft.orientation = (i64)(directory.uint(tag_orientation) else 0)
+    if not draft.rated:
+        if let rating = directory.find(tag_rating):
+            if let value = rating.int(0):
+                draft.rating = value
+                draft.rated = true
+    if let info = directory.find(tag_dng_lens_info):
+        read_lens_range(draft, &info)
+    if let packet = directory.find(tag_xmp):
+        read_xmp(draft, packet.data)
+    if draft.format.length == 0 and directory.find(tag_dng_version) != none:
+        draft.format = "DNG"
+    read_size(draft, directory)
+    if let pointer = directory.uint(tag_exif_ifd):
+        if let exif = directory.child(pointer):
+            read_exif(draft, &exif)
+    if let pointer = directory.uint(tag_gps_ifd):
+        if let gps = directory.child(pointer):
+            read_gps(draft, &gps)
+    if let jpeg = directory.find(tag_panasonic_jpeg):
+        _ = read_jpeg(draft, jpeg.data)
+    if draft.iso == 0 and draft.format.length == 0:
+        # Only Panasonic's raw IFD0 uses this tag number for the ISO.
+        if has_at(file_magic(directory), 0, b"IIU"):
+            draft.iso = (i64)(directory.uint(tag_panasonic_iso) else 0)
+
+## The first bytes of the TIFF stream `directory` belongs to.
+func file_magic(directory: const Directory*) -> const u8[]:
+    return span(directory.file, directory.base, 3) else b""
+
+## The size of a full image this directory or its SubIFDs hold; reduced-resolution
+## images (NewSubfileType bit 0) do not count.
+func read_size(draft: Draft*, directory: const Directory*):
+    read_one_size(draft, directory)
+    let subs = directory.find(tag_sub_ifds) else return
+    let count = subs.count if subs.count < most_sub_ifds else most_sub_ifds
+    for index in 0..<count:
+        let pointer = subs.uint(index) else continue
+        if let sub = directory.child(pointer):
+            read_one_size(draft, &sub)
+
+func read_one_size(draft: Draft*, directory: const Directory*):
+    let kind = directory.uint(tag_new_subfile_type) else 0
+    if kind & 1 != 0:
+        return
+    var width = (i64)(directory.uint(tag_width) else 0)
+    var height = (i64)(directory.uint(tag_height) else 0)
+    # A DNG's developed size is its default crop, not the sensor's.
+    if let crop = directory.find(tag_default_crop_size):
+        if crop.count >= 2:
+            width = (i64)(crop.real(0) else (f64)width)
+            height = (i64)(crop.real(1) else (f64)height)
+    draft.size(width, height)
+
+## The EXIF directory: exposure, dates, the lens, sizes and the maker note.
+func read_exif(draft: Draft*, directory: const Directory*):
+    if draft.exposure_time == 0.0:
+        if let time = directory.real(tag_exposure_time):
+            draft.exposure_time = time
+        elif let apex = directory.real(tag_shutter_value):
+            draft.exposure_time = 1.0 / pow2(apex)
+    if draft.f_number == 0.0:
+        if let number = directory.real(tag_f_number):
+            draft.f_number = number
+        elif let apex = directory.real(tag_aperture_value):
+            draft.f_number = sqrt2_pow(apex)
+    if draft.iso == 0:
+        draft.iso = (i64)(directory.uint(tag_iso) else directory.uint(tag_recommended_index) else 0)
+    if draft.exposure_bias == 0.0:
+        draft.exposure_bias = directory.real(tag_exposure_bias) else 0.0
+    if draft.focal_length == 0.0:
+        draft.focal_length = directory.real(tag_focal_length) else 0.0
+    if draft.focal_length_35 == 0:
+        draft.focal_length_35 = (i64)(directory.uint(tag_focal_35) else 0)
+    if draft.metering == 0:
+        draft.metering = (i64)(directory.uint(tag_metering) else 0)
+    if draft.exposure_program == 0:
+        draft.exposure_program = (i64)(directory.uint(tag_exposure_program) else 0)
+    if let flash = directory.uint(tag_flash):
+        draft.flash = draft.flash or flash & 1 != 0
+    draft.first_text(&draft.date_original, directory.text(tag_date_original))
+    draft.first_text(&draft.date_digitized, directory.text(tag_date_digitized))
+    draft.first_text(&draft.offset, clean_offset(directory.text(tag_offset_original)))
+    draft.first_text(&draft.offset, clean_offset(directory.text(tag_offset_time)))
+    draft.first_text(&draft.subseconds, digits_only(directory.text(tag_subsec_original)))
+    draft.first_text(&draft.serial, directory.text(tag_body_serial))
+    draft.first_text(&draft.lens, directory.text(tag_lens_model))
+    if let specification = directory.find(tag_lens_specification):
+        read_lens_range(draft, &specification)
+    let width = (i64)(directory.uint(tag_pixel_width) else 0)
+    let height = (i64)(directory.uint(tag_pixel_height) else 0)
+    if draft.width == 0:
+        draft.size(width, height)
+    if let note = directory.find(tag_maker_note):
+        read_maker_note(draft, directory.file, note.data)
+
+## The lens's focal and aperture range, kept when no earlier source gave one.
+func read_lens_range(draft: Draft*, entry: const Entry*):
+    if entry.count < 4 or draft.lens_range[0] > 0.0:
+        return
+    for index in 0..<4:
+        draft.lens_range[index] = entry.real((u64)index) else 0.0
+
+## The GPS directory: latitude and longitude as degrees, minutes and seconds with their
+## hemisphere letters, altitude with its above/below sea level byte.
+func read_gps(draft: Draft*, directory: const Directory*):
+    let latitude = degrees(directory, 2) else return
+    let longitude = degrees(directory, 4) else return
+    let north = directory.text(1)
+    let east = directory.text(3)
+    # Cameras without a fix write the directory anyway: empty references, zeros, or
+    # GPSStatus "V" (void).
+    if not (north == "N" or north == "S") or not (east == "E" or east == "W"):
+        return
+    if directory.text(9) == "V" or (latitude == 0.0 and longitude == 0.0):
+        return
+    draft.has_gps = true
+    draft.latitude = -latitude if north == "S" else latitude
+    draft.longitude = -longitude if east == "W" else longitude
+    if let altitude = directory.real(6):
+        let below = directory.uint(5) else 0
+        draft.altitude = -altitude if below == 1 else altitude
+
+## Degrees from the three rationals of `tag` (degrees, minutes, seconds).
+func degrees(directory: const Directory*, tag: u64) -> f64?:
+    let entry = directory.find(tag) else return none
+    if entry.count < 3:
+        return none
+    let whole = entry.real(0) else return none
+    let minutes = entry.real(1) else 0.0
+    let seconds = entry.real(2) else 0.0
+    return whole + minutes / 60.0 + seconds / 3600.0
+
+## `text` when it is only digits, else "".
+func digits_only(text: str) -> str:
+    for byte in text.bytes:
+        if byte < '0' or byte > '9':
+            return ""
+    return text
+
+## 2^x, for APEX values.
+func pow2(x: f64) -> f64:
+    return math.pow(2.0, x)
+
+## √2^x: the f-number of an APEX aperture value.
+func sqrt2_pow(x: f64) -> f64:
+    return math.pow(2.0, x * 0.5)

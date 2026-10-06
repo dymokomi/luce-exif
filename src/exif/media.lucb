@@ -1,0 +1,202 @@
+#==============================================================================================
+#
+#   exif/media - ISO base media files: Canon CR3, HEIF/HEIC and AVIF
+#
+#   DESCRIPTION:
+#       These files are trees of boxes (a big-endian size and a four-letter type). A CR3
+#       keeps its TIFF streams in Canon's uuid box inside moov: CMT1 is IFD0, CMT2 the
+#       EXIF directory, CMT4 the GPS directory, each with a TIFF header of its own; XMP is
+#       a top-level uuid box. HEIF and AVIF name their items in meta/iinf and place them
+#       with meta/iloc: the "Exif" item is a four-byte offset and then a TIFF stream, and
+#       an XMP item is a "mime" item of type application/rdf+xml.
+#
+#==============================================================================================
+
+let canon_uuid: u8[16] = [0x85, 0xc0, 0xb6, 0x87, 0x82, 0x0f, 0x11, 0xe0, 0x81, 0x11, 0xf4, 0xce, 0x46, 0x2b, 0x6a, 0x48]
+let xmp_uuid: u8[16] = [0xbe, 0x7a, 0xcf, 0xcb, 0x97, 0xa9, 0x42, 0xe8, 0x9c, 0x71, 0x99, 0x94, 0x91, 0xe3, 0xaf, 0xac]
+
+## The most boxes walked at one level.
+let most_boxes: usize = 4096
+
+## One box: where its payload starts and ends in the file, and its type.
+struct Box:
+    var start: u64
+    var end: u64
+    var kind: const u8[]
+
+## The box at `at`, which must end by `limit`, or none.
+func box_at(data: const u8[], at: u64, limit: u64) -> Box?:
+    let size = be32(data, at) else return none
+    let kind = span(data, at + 4, 4) else return none
+    var header: u64 = 8
+    var total = size
+    if size == 1:
+        total = uint_at(data, at + 8, 8, false) else return none
+        header = 16
+    elif size == 0:
+        total = limit - at
+    if total < header:
+        return none
+    let end = at +? total else return none
+    if end > limit:
+        return none
+    return Box(start = at + header, end = end, kind = kind)
+
+## The first box of type `kind` among those from `from_at` to `limit`.
+func find_box(data: const u8[], from_at: u64, limit: u64, kind: const u8[]) -> Box?:
+    var at = from_at
+    var walked: usize = 0
+    while at < limit and walked < most_boxes:
+        walked += 1
+        let found = box_at(data, at, limit) else return none
+        if has_at(found.kind, 0, kind):
+            return found
+        at = found.end
+    return none
+
+## The first uuid box among those from `from_at` to `limit` whose uuid is `uuid`.
+func find_uuid(data: const u8[], from_at: u64, limit: u64, uuid: const u8[]) -> Box?:
+    var at = from_at
+    var walked: usize = 0
+    while at < limit and walked < most_boxes:
+        walked += 1
+        let found = box_at(data, at, limit) else return none
+        if has_at(found.kind, 0, b"uuid") and has_at(data, found.start, uuid):
+            return found
+        at = found.end
+    return none
+
+## A CR3, HEIF or AVIF file, by its ftyp brand.
+func read_media(draft: Draft*, data: const u8[]) -> !:
+    let limit = (u64)data.length
+    if has_at(data, 8, b"crx "):
+        draft.format = "CR3"
+        try read_cr3(draft, data, limit)
+    elif has_at(data, 8, b"avif") or has_at(data, 8, b"avis"):
+        draft.format = "AVIF"
+        try read_heif(draft, data, limit)
+    elif has_at(data, 8, b"heic") or has_at(data, 8, b"heix") or has_at(data, 8, b"mif1") or has_at(data, 8, b"msf1") or has_at(data, 8, b"heim") or has_at(data, 8, b"heis"):
+        draft.format = "HEIF"
+        try read_heif(draft, data, limit)
+    else:
+        error(unrecognized, "an ISO media file that is no CR3, HEIF or AVIF")
+
+# mark: CR3 ===================================================================================
+
+func read_cr3(draft: Draft*, data: const u8[], limit: u64) -> !:
+    let movie = find_box(data, 0, limit, b"moov") else error(truncated, "the CR3 has no moov box")
+    let canon = find_uuid(data, movie.start, movie.end, canon_uuid) else error(truncated, "the CR3 has no Canon metadata box")
+    let inner = canon.start + 16
+    if let ifd0 = find_box(data, inner, canon.end, b"CMT1"):
+        _ = read_tiff(draft, data, ifd0.start)
+    if let exif = find_box(data, inner, canon.end, b"CMT2"):
+        if let directory = tiff_header(data, exif.start):
+            read_exif(draft, &directory)
+    if let gps = find_box(data, inner, canon.end, b"CMT4"):
+        if let directory = tiff_header(data, gps.start):
+            read_gps(draft, &directory)
+    if let packet = find_uuid(data, 0, limit, xmp_uuid):
+        if let bytes = span(data, packet.start + 16, packet.end - packet.start - 16):
+            read_xmp(draft, bytes)
+
+# mark: HEIF ==================================================================================
+
+## The items a HEIF names for its metadata, and where iloc puts them.
+struct Items:
+    var exif: u64
+    var xmp: u64
+
+func read_heif(draft: Draft*, data: const u8[], limit: u64) -> !:
+    let meta = find_box(data, 0, limit, b"meta") else error(truncated, "the HEIF has no meta box")
+    # meta is a full box: version and flags come first.
+    let children = meta.start + 4
+    var items = Items(exif = 0, xmp = 0)
+    if let info = find_box(data, children, meta.end, b"iinf"):
+        read_item_infos(data, &info, &items)
+    let locations = find_box(data, children, meta.end, b"iloc") else return
+    if items.exif != 0:
+        if let payload = item_bytes(data, &locations, items.exif):
+            # The payload starts with the offset of the TIFF header after these four bytes.
+            if let skip = be32(payload, 0):
+                if let header = skip +? 4:
+                    _ = read_tiff(draft, payload, header)
+    if items.xmp != 0:
+        if let payload = item_bytes(data, &locations, items.xmp):
+            read_xmp(draft, payload)
+
+## Find the Exif item and an XMP mime item in iinf's infe boxes (versions 2 and 3).
+func read_item_infos(data: const u8[], info: const Box*, items: Items*):
+    let version = uint_at(data, info.start, 1, false) else return
+    var at = info.start + 4
+    at += 2 if version == 0 else 4
+    var walked: usize = 0
+    while at < info.end and walked < most_boxes:
+        walked += 1
+        let entry = box_at(data, at, info.end) else return
+        at = entry.end
+        if not has_at(entry.kind, 0, b"infe"):
+            continue
+        let entry_version = uint_at(data, entry.start, 1, false) else continue
+        if entry_version < 2:
+            continue
+        var cursor = entry.start + 4
+        let width: u64 = 2 if entry_version == 2 else 4
+        let id = uint_at(data, cursor, width, false) else continue
+        cursor += width + 2
+        let kind = span(data, cursor, 4) else continue
+        cursor += 4
+        if has_at(kind, 0, b"Exif"):
+            items.exif = id
+        elif has_at(kind, 0, b"mime"):
+            # item_name, then content_type, both NUL-terminated.
+            let rest = span(data, cursor, entry.end - cursor) else continue
+            let name_end = find_bytes(rest, 0, b"\x00") else continue
+            if find_bytes(rest, name_end + 1, b"rdf+xml") != none:
+                items.xmp = id
+
+## The bytes of item `id`'s first extent, placed by iloc in the file (construction
+## method 0).
+func item_bytes(data: const u8[], locations: const Box*, id: u64) -> const u8[]?:
+    let version = uint_at(data, locations.start, 1, false) else return none
+    var at = locations.start + 4
+    let sizes = uint_at(data, at, 2, false) else return none
+    let offset_size = (sizes >> 12) & 15
+    let length_size = (sizes >> 8) & 15
+    let base_size = (sizes >> 4) & 15
+    let index_size = sizes & 15 if version == 1 or version == 2 else 0
+    at += 2
+    let count_width: u64 = 2 if version < 2 else 4
+    let count = uint_at(data, at, count_width, false) else return none
+    at += count_width
+    let id_width: u64 = 2 if version < 2 else 4
+    var walked: u64 = 0
+    while walked < count and walked < (u64)most_boxes:
+        walked += 1
+        let item = uint_at(data, at, id_width, false) else return none
+        at += id_width
+        var method: u64 = 0
+        if version == 1 or version == 2:
+            method = (uint_at(data, at, 2, false) else return none) & 15
+            at += 2
+        at += 2
+        let base = uint_at(data, at, base_size, false) else return none
+        at += base_size
+        let extents = uint_at(data, at, 2, false) else return none
+        at += 2
+        var first_offset: u64 = 0
+        var first_length: u64 = 0
+        for extent in 0..<extents:
+            at += index_size
+            let offset = uint_at(data, at, offset_size, false) else return none
+            at += offset_size
+            let length = uint_at(data, at, length_size, false) else return none
+            at += length_size
+            if extent == 0:
+                first_offset = offset
+                first_length = length
+        if item == id:
+            if method != 0 or extents == 0:
+                return none
+            let start = base +? first_offset else return none
+            return span(data, start, first_length)
+    return none
