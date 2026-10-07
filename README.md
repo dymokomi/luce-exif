@@ -69,16 +69,17 @@ Not read yet:
 ## Tests
 
 ```sh
-./test.sh                    # module tests, fixtures, the Luce crossing; native and C
+luc test                     # module tests and the test programs in tests/<name>/
 tools/fetch_exiftool.sh      # optional: ExifTool into build/, for the sample comparison
 ```
 
-`tests/run.py` runs the module's own tests: hand-built TIFF and JPEG files, every
-truncation and byte flip of a TIFF, and the date, shutter and lens texts. It
-compares the dump of `tests/fixtures` (a JPEG, PNG and HEIC made by
-`tools/make_fixtures.py`) with `expected.txt`, and builds a Luce program that reads
-a fixture. When ExifTool and luce-raw's camera samples are present, it also checks
-every sample against ExifTool: make, model, lens, serial, date, offset, subseconds,
+The module's own tests cover hand-built TIFF and JPEG files, every truncation and
+byte flip of a TIFF, and the date, shutter and lens texts. `tests/dump` dumps
+`tests/fixtures` (a JPEG, a PNG and a HEIC made by `tools/make_fixtures.py`), and
+luc test holds its output to `tests/dump/expected`. `tests/luce_read` is a Luce
+program that reads a fixture. `tests/exiftool` checks every one of luce-raw's camera
+samples against ExifTool, and is skipped when ExifTool or the samples are not
+there: make, model, lens, serial, date, offset, subseconds,
 exposure time, f-number, ISO, focal lengths, orientation, GPS, rating and film
 simulation. That covers 32 samples: Leica M240 DNG, five Fujifilm RAFs (X-Trans
 and Bayer, GFX), Canon CR2/CR3, Nikon, Sony, Olympus, Panasonic, Pentax, and

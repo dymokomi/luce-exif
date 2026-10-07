@@ -1,0 +1,232 @@
+## Every camera sample's metadata held to ExifTool's: the camera, lens, serial, capture
+## time and offset, exposure, focal lengths, orientation, GPS, XMP rating and Fujifilm's
+## film simulation. ExifTool is build/exiftool/exiftool (tools/fetch_exiftool.sh) or on
+## the PATH; the samples are luce-raw's, checked out beside this package. Without
+## either the test is skipped, with the reason.
+import c
+import memory
+import strings
+from luce_std import files
+from luce_std import math
+from luce_std import paths
+from luce_std import process
+from luce_std.collections import List, TextPool
+from luce_exif import exif
+
+let sample_folder: str = "../luce-raw/build/samples"
+
+## The tags asked of ExifTool, in its -T columns' order.
+let tags: str[19] = ["-IFD0:Make", "-IFD0:Model", "-ExifIFD:LensModel", "-ExifIFD:SerialNumber", "-DateTimeOriginal",
+                     "-OffsetTimeOriginal", "-SubSecTimeOriginal", "-ExifIFD:ExposureTime", "-ExifIFD:FNumber", "-ExifIFD:ISO",
+                     "-ExifIFD:FocalLength", "-ExifIFD:FocalLengthIn35mmFormat", "-IFD0:Orientation", "-GPSLatitude",
+                     "-GPSLongitude", "-GPSLatitudeRef", "-XMP:Rating", "-FujiFilm:FilmMode", "-FujiFilm:Saturation"]
+
+## Column `at` of a -T line (tab-separated), or "" for ExifTool's "-" (none).
+func column(line: str, at: usize) -> str:
+    var index: usize = 0
+    var first: usize = 0
+    for (position, byte) in line.bytes.indexed():
+        if byte == '\t':
+            if index == at:
+                let value = (str)line.bytes[first..<position]
+                return "" if value == "-" else value
+            index += 1
+            first = position + 1
+    if index == at:
+        let value = (str)line.bytes[first..]
+        return "" if value == "-" else value
+    return ""
+
+## Fujifilm's FilmMode values, by name.
+func film_name(mode: i64) -> str:
+    return match mode:
+        0x000 => "Provia/Standard"
+        0x120 => "Astia/Soft"
+        0x200 => "Velvia/Vivid"
+        0x400 => "Velvia/Vivid"
+        0x500 => "Pro Neg. Std"
+        0x501 => "Pro Neg. Hi"
+        0x600 => "Classic Chrome"
+        0x700 => "Eterna/Cinema"
+        0x800 => "Classic Neg."
+        0x900 => "Eterna Bleach Bypass"
+        0xa00 => "Nostalgic Neg."
+        0xb00 => "Reala Ace"
+        _ => ""
+
+## Fujifilm's monochrome Saturation values, by name ("" when not monochrome).
+func monochrome_name(saturation: i64) -> str:
+    return match saturation:
+        0x300 => "Monochrome"
+        0x301 => "Monochrome+R Filter"
+        0x302 => "Monochrome+Ye Filter"
+        0x303 => "Monochrome+G Filter"
+        0x310 => "Sepia"
+        0x500 => "Acros"
+        0x501 => "Acros+R Filter"
+        0x502 => "Acros+Ye Filter"
+        0x503 => "Acros+G Filter"
+        _ => ""
+
+## Comparisons made and failed, printed as they fail.
+struct Tally:
+    var compared: i64
+    var failed: i64
+    var sample: str
+
+    func text(field: str, ours: str, theirs: str):
+        if theirs == "":
+            return
+        self.compared += 1
+        if ours != theirs:
+            self.failed += 1
+            print(f"FAIL  {self.sample}: {field} '{ours}', ExifTool '{theirs}'")
+
+    func integer(field: str, ours: i64, theirs: str):
+        if theirs == "":
+            return
+        self.compared += 1
+        let value = strings.parse_i64(theirs) else ours - 1
+        if ours != value:
+            self.failed += 1
+            print(f"FAIL  {self.sample}: {field} {ours}, ExifTool '{theirs}'")
+
+    func number(field: str, ours: f64, theirs: str):
+        if theirs == "":
+            return
+        self.compared += 1
+        let value = strings.parse_f64(theirs) catch failure:
+            recover ours + 1.0
+        if math.abs(ours - value) > 1.0e-6 * math.max(1.0, math.abs(value)):
+            self.failed += 1
+            print(f"FAIL  {self.sample}: {field} {ours}, ExifTool '{theirs}'")
+
+## ExifTool's path, or none when it is not installed.
+func find_exiftool() -> str?:
+    if files.exists("build/exiftool/exiftool"):
+        return "build/exiftool/exiftool"
+    var probe: c.str[1] = ["-ver"]
+    let ran = process.run("exiftool", probe) catch failure:
+        return none
+    defer ran.release()
+    return "exiftool" if ran.value.exit_code == 0 else none
+
+## Compare one sample's metadata with its ExifTool line.
+func compare(path: str, line: str, tally: Tally*) -> !:
+    tally.sample = paths.base(path)
+    let terminated = try strings.copy(path)
+    defer strings.release(terminated)
+    let data = try files.read((c.str)terminated)
+    defer data.release()
+    let found = exif.read(data.value) catch failure:
+        tally.failed += 1
+        print(f"FAIL  {tally.sample}: {failure.message}")
+        return
+    defer found.release()
+    let m = found.value
+    tally.text("make", m.make, column(line, 0))
+    tally.text("model", m.model, column(line, 1))
+    tally.text("lens", m.lens, column(line, 2))
+    tally.text("serial", m.serial, column(line, 3))
+    let original = column(line, 4)
+    if original.length >= 19:
+        var captured: u8[19]
+        memory.copy(captured, original.bytes[..<19], 19)
+        captured[4] = '-'
+        captured[7] = '-'
+        captured[10] = 'T'
+        tally.text("captured", m.captured, (str)captured)
+    tally.text("offset", m.offset, column(line, 5))
+    tally.text("subseconds", m.subseconds, column(line, 6))
+    tally.number("exposure_time", m.exposure_time, column(line, 7))
+    tally.number("f_number", m.f_number, column(line, 8))
+    tally.integer("iso", m.iso, column(line, 9))
+    tally.number("focal_length", m.focal_length, column(line, 10))
+    tally.integer("focal_length_35", m.focal_length_35, column(line, 11))
+    let orientation = column(line, 12)
+    tally.integer("orientation", m.orientation, orientation if orientation != "" else "1")
+    let reference = column(line, 15)
+    if (reference == "N" or reference == "S") and column(line, 13) != "":
+        tally.number("latitude", m.latitude, column(line, 13))
+        tally.number("longitude", m.longitude, column(line, 14))
+    tally.integer("rating", m.rating, column(line, 16))
+    let saturation = strings.parse_i64(column(line, 18)) else -1
+    let mode = column(line, 17)
+    if monochrome_name(saturation) != "":
+        tally.text("film_simulation", m.film_simulation, monochrome_name(saturation))
+    elif mode != "":
+        let number = strings.parse_i64(mode) else -1
+        tally.compared += 1
+        if m.film_simulation != film_name(number):
+            tally.failed += 1
+            print(f"FAIL  {tally.sample}: film_simulation '{m.film_simulation}', ExifTool {film_name(number)}")
+
+## Say why the test is skipped; the exit status of a skip.
+func skip(reason: str) -> i32:
+    print(f"skip: {reason}")
+    return 0
+
+## Give back the NUL-terminated copies made for ExifTool's arguments.
+func release_all(texts: List[str]*):
+    for text in texts.view():
+        strings.release(text)
+    texts.destroy()
+
+pub func main(arguments: str[]) -> i32!:
+    let tool = find_exiftool() else return skip("ExifTool is not installed (tools/fetch_exiftool.sh fetches it)")
+    let folder = try strings.copy(sample_folder)
+    defer strings.release(folder)
+    if not files.exists((c.str)folder):
+        return skip("no camera samples in ../luce-raw/build/samples (luce-raw's tests fetch them)")
+    let listed = try files.list((c.str)folder)
+    defer listed.release()
+    var pool: TextPool
+    defer pool.destroy()
+    var samples: List[str]
+    defer samples.destroy()
+    for name in listed.value:
+        if name.length > 0 and name.bytes[0] != '.':
+            let joined = try paths.join(sample_folder, name)
+            defer joined.release()
+            try samples.append(try pool.keep_text(joined.value.bytes))
+    # ExifTool -T: one line per file, the tags' values tab-separated, "-" for none.
+    var words: List[c.str]
+    defer words.destroy()
+    var owned: List[str]
+    defer release_all(&owned)
+    for word in ["-T", "-n"]:
+        let copy = try strings.copy(word)
+        try owned.append(copy)
+        try words.append((c.str)copy)
+    for tag in tags:
+        let copy = try strings.copy(tag)
+        try owned.append(copy)
+        try words.append((c.str)copy)
+    for sample in samples.view():
+        let copy = try strings.copy(sample)
+        try owned.append(copy)
+        try words.append((c.str)copy)
+    let program = try strings.copy(tool)
+    defer strings.release(program)
+    let ran = try process.run((c.str)program, words.view())
+    defer ran.release()
+    if ran.value.exit_code != 0:
+        print("FAIL  ExifTool failed")
+        return 1
+    var tally = Tally()
+    let output = ran.value.output
+    var first: usize = 0
+    for sample in samples.view():
+        var end = first
+        while end < output.length and output.bytes[end] != '\n':
+            end += 1
+        if first >= output.length:
+            print(f"FAIL  ExifTool printed no line for {paths.base(sample)}")
+            return 1
+        try compare(sample, (str)output.bytes[first..<end], &tally)
+        first = end + 1
+    if tally.failed > 0:
+        print(f"{tally.failed} of {tally.compared} fields differ from ExifTool")
+        return 1
+    print(f"PASS {samples.length()} camera samples, {tally.compared} fields agree with ExifTool")
+    return 0

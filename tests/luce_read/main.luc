@@ -7,7 +7,7 @@ func metadata(path: str) -> exif.Metadata!:
     let data = files.read(path)
     return exif.read(data)
 
-test "a Luce program reads a JPEG's metadata":
+func reads_a_jpeg() -> unit!:
     let m = metadata("tests/fixtures/camera.jpg")
     assert(m.format == "JPEG")
     assert(m.make == "FUJIFILM")
@@ -25,8 +25,14 @@ test "a Luce program reads a JPEG's metadata":
     assert(m.label == "Green")
     assert(m.width == 64)
 
-test "unknown bytes fail in Luce with the package's code":
+func refuses_unknown_bytes() -> unit!:
     let failed = exif.read(b"not an image") catch failure:
         assert(failure.code == exif.unrecognized)
         return
     assert(failed.format == "", "plain text was read as metadata")
+
+pub func main(arguments: list[str]) -> int!:
+    reads_a_jpeg()
+    refuses_unknown_bytes()
+    print("PASS a Luce program reads a JPEG's metadata and is refused unknown bytes")
+    return 0

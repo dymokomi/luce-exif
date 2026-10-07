@@ -4,7 +4,7 @@
 #
 #   DESCRIPTION:
 #       Small TIFF, JPEG and PNG files built byte by byte: the tags this package reads, the
-#       texts it writes, and damage it must survive. The camera files are tests/run.py's,
+#       texts it writes, and damage it must survive. The camera files are tests/exiftool's,
 #       compared with ExifTool.
 #
 #==============================================================================================

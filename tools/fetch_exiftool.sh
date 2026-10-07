@@ -1,5 +1,5 @@
 #!/bin/sh
-# Fetch ExifTool (Phil Harvey's, Perl) into build/exiftool for tests/run.py's sample
+# Fetch ExifTool (Phil Harvey's, Perl) into build/exiftool for tests/exiftool's sample
 # comparison. CPAN keeps every release; exiftool.org only the newest.
 set -eu
 cd "$(dirname "$0")/.."

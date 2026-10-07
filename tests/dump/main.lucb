@@ -1,6 +1,6 @@
-## The driver tests/run.py builds: `dump FILE...` prints each file's metadata, one
-## `key<TAB>value` line per field and a blank line after each file, for the checks to
-## compare with ExifTool.
+## `dump FILE...` prints each file's metadata, one `key<TAB>value` line per field and a
+## blank line after each file. With no files it dumps the fixtures (a JPEG, a PNG and a
+## HEIC with known metadata), and luc test holds the output to tests/dump/expected.
 import c
 from luce_std import files
 from luce_exif import exif
@@ -43,11 +43,19 @@ func show(path: c.str) -> !:
     print(f"film_simulation\t{m.film_simulation}")
     print("")
 
-pub func main(arguments: c.str[]) -> i32:
+let fixtures: c.str[3] = ["tests/fixtures/camera.jpg", "tests/fixtures/camera.png", "tests/fixtures/camera.heic"]
+
+## Dump every file of `chosen`; 1 when one could not be read.
+func dump_all(chosen: const c.str[]) -> i32:
     var status: i32 = 0
-    for path in arguments[1..]:
+    for path in chosen:
         show(path) catch failure:
             print(f"error\t{failure.message}")
             print("")
             status = 1
     return status
+
+pub func main(arguments: c.str[]) -> i32:
+    if arguments.length > 1:
+        return dump_all(arguments[1..])
+    return dump_all(fixtures)
