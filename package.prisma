@@ -1,7 +1,7 @@
 #prisma 4.0
 def package "luce-exif" {
     str owner = "dymokomi"
-    str version = "0.1.1"
+    str version = "0.1.2"
     str kind = "package"
     str language = "luce-base"
     str description = "Photo metadata for Luce/Base: EXIF, GPS and XMP rating/label from DNG, TIFF raws, RAF, CR3, JPEG, HEIF and PNG: camera, lens, capture time, exposure, orientation, size and Fujifilm film simulation."
